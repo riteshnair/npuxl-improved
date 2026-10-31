@@ -45,14 +45,20 @@ SELFTEST_SRCS := tools/selftest_main.cpp tools/selftest.cpp
 NODE_SRCS := tools/node_main.cpp
 FUZZ_SRCS := tests/fuzz_shapes.cpp
 
-.PHONY: all clean test fuzz benchmark release install pcem-check
+.PHONY: all clean test fuzz benchmark bench-matrix release install pcem-check
+
+-include $(LIB_OBJS:.o=.d)
 
 all: lib/libvnpu.so lib/libvnpu.a bin/vnpu-cli bin/vnpu-node \
-     bin/vnpu-selftest bin/vnpu-fuzz
+     bin/vnpu-selftest bin/vnpu-fuzz bin/vnpu-conformance
+
+# Header dependencies: without these a header edit relinks stale objects and the
+# binary silently keeps running old code.
+DEPFLAGS := -MMD -MP
 
 build/obj/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -MF $(@:.o=.d) -c $< -o $@
 
 lib/libvnpu.so: $(LIB_OBJS)
 	@mkdir -p lib
@@ -79,6 +85,15 @@ bin/vnpu-fuzz: $(FUZZ_SRCS) lib/libvnpu.so
 	@mkdir -p bin
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(FUZZ_SRCS) $(LINK_LIB) $(LDFLAGS) -o $@
 
+bin/vnpu-conformance: tools/conformance.cpp lib/libvnpu.so
+	@mkdir -p bin
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) tools/conformance.cpp $(LINK_LIB) $(LDFLAGS) -o $@
+
+# The "same answer everywhere" claim, tested rather than asserted: every unit,
+# thread count and B structure against an independent plain-C reference.
+conformance: bin/vnpu-conformance
+	./bin/vnpu-conformance $(CONFORMANCE_ARGS)
+
 fuzz: bin/vnpu-fuzz
 	./bin/vnpu-fuzz 100
 
@@ -86,12 +101,28 @@ test: all
 	@mkdir -p benchmarks
 	./bin/vnpu-selftest
 	./bin/vnpu-fuzz 60
+	./bin/vnpu-conformance
 	./bin/vnpu-cli bench --shape 64x64x64 --shape 128x128x128 \
 	  --dtype both --iterations 1 --json benchmarks/selftest-bench.json
 	./bin/vnpu-cli cluster-demo --shape 64x64x64 --iterations 1 \
 	  --port1 19450 --port2 19451 --token test
 	./bin/vnpu-cli specdemo --steps 2 --hidden 64 --vocab 64 --gamma 3 \
 	  --port1 19452 --port2 19453 --token test
+
+bench-matrix: lib/libvnpu.so
+	@mkdir -p bin
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) tools/bench_kernels.cpp $(LINK_LIB) $(LDFLAGS) \
+	  -o bin/bench_kernels
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) tools/bench_scaling.cpp $(LINK_LIB) $(LDFLAGS) \
+	  -o bin/bench_scaling
+
+# Instruction-ceiling probe: FMA-only, +B loads, +A broadcasts, 1 and 2 threads.
+# Run this first on any new machine -- every "% of peak" claim needs it, and
+# bench_scaling's single-shot 10-chain loop under-reports the ceiling by ~10%.
+peak: benchmarks/peak_probe.cpp
+	@mkdir -p bin
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< $(LDFLAGS) -o bin/vnpu-peak
+	./bin/vnpu-peak
 
 benchmark: all
 	@mkdir -p benchmarks
@@ -145,5 +176,10 @@ install: all
 	cp lib/libvnpu.so lib/libvnpu.a $(PREFIX)/lib/
 	cp bin/vnpu-cli bin/vnpu-node bin/vnpu-selftest $(PREFIX)/bin/
 
+# Untracked build outputs only: `make clean` must leave `git status` untouched.
+# It used to `rm -rf benchmarks/*.json benchmarks/*.txt release/*.tar.gz`, which
+# destroyed tracked data -- no target recreates the release archives, and the
+# benchmark records are evidence. lib/*.a|*.so are tracked too, so they are
+# rebuilt in place (objects are gone, so `all` relinks) instead of deleted.
 clean:
-	rm -rf build lib bin benchmarks/*.json benchmarks/*.txt release/*.tar.gz
+	rm -rf build bin

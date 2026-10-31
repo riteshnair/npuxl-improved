@@ -178,6 +178,11 @@ struct CpuFeatures {
     uint64_t bits = VNPU_FEATURE_SCALAR;
     uint32_t simd_bits = 0;
     uint32_t logical_cpus = 1;
+    /* Physical cores.  SMT siblings share L1/L2, and these kernels depend on
+     * L1 residency, so the default unit count follows this rather than the
+     * logical count (measured 2/2 on the reference VM; on a 14c/18t hybrid
+     * laptop it keeps the device from oversubscribing). */
+    uint32_t physical_cpus = 1;
     uint64_t l1d = 32 * 1024;
     uint64_t l2 = 256 * 1024;
     uint64_t l3 = 8 * 1024 * 1024;
@@ -215,22 +220,141 @@ public:
     uint32_t size() const { return static_cast<uint32_t>(workers_.size()); }
     void enqueue(std::function<void()> task);
 
+    /* Batch lease.
+     *
+     * A batch runs its commands back to back, and every command ends in its own
+     * parallel_for -- a sleep/wake round trip per command.  While a lease is
+     * held, workers spin briefly for the next task instead of blocking, so the
+     * gap between two commands of one batch costs a few pauses rather than a
+     * futex sleep.  Bounded by kLeaseSpinUs, so an idle pool still parks. */
+    static constexpr uint32_t kLeaseSpinUs = 8;
+
+    void lease_acquire()
+    {
+        lease_depth_.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    void lease_release()
+    {
+        if (lease_depth_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            /* Last lease gone: let spinning workers fall through to the wait
+             * instead of finishing their remaining spin budget. */
+            std::lock_guard<std::mutex> lock(mutex_);
+            cv_.notify_all();
+        }
+    }
+
+    struct ScopedLease {
+        ThreadPool *pool;
+        explicit ScopedLease(ThreadPool *p) : pool(p) { pool->lease_acquire(); }
+        ~ScopedLease() { pool->lease_release(); }
+        ScopedLease(const ScopedLease &) = delete;
+        ScopedLease &operator=(const ScopedLease &) = delete;
+    };
+
+    /* Per-unit speed weights (index 0 is the issuing thread).  Empty or uniform
+     * means every unit runs at the same rate, so dynamic chunk stealing is
+     * used unchanged. */
+    void set_unit_weights(std::vector<float> w)
+    {
+        unit_weights_ = std::move(w);
+        weighted_ = false;
+        if (unit_weights_.empty()) return;
+        float lo = unit_weights_[0], hi = unit_weights_[0];
+        for (float x : unit_weights_) {
+            if (!(x > 0.0f)) x = 1.0f;
+            lo = std::min(lo, x);
+            hi = std::max(hi, x);
+        }
+        weighted_ = (hi > lo * 1.05f);
+    }
+
     template <typename Fn>
     void parallel_for(uint64_t n, uint64_t grain, Fn fn)
     {
         if (n == 0) return;
-        if (workers_.empty()) {
+        grain = std::max<uint64_t>(1, grain);
+        const uint64_t chunks = (n + grain - 1) / grain;
+        /* A single chunk is pure launch cost if it is handed to a worker:
+         * decoding issues many tiny commands, and each one used to pay a
+         * condvar wake (~15-35 us) instead of running inline. */
+        if (workers_.empty() || chunks <= 1) {
             fn(0, n, 0);
             return;
         }
-        grain = std::max<uint64_t>(1, grain);
         auto state = std::make_shared<ParallelState>();
         state->n = n;
         state->grain = grain;
-        state->chunks = (n + grain - 1) / grain;
+        state->chunks = chunks;
+        /* The calling thread is itself a compute unit, so only the remaining
+         * units are woken: a 2-unit device runs two threads, not three. */
         state->worker_count = static_cast<uint32_t>(
-            std::min<uint64_t>(workers_.size(), state->chunks));
+            std::min<uint64_t>(workers_.size() - 1, chunks - 1));
         state->remaining.store(state->chunks);
+
+        /* Heterogeneous units: split the range once, proportionally to each
+         * unit's speed, instead of letting fast units race ahead and then idle
+         * at the barrier.  That only pays for a coarse partition; with many
+         * chunks the atomic counter already hands the fast unit proportionally
+         * more work, and a fixed ratio would cap it (measured: a 2:1 split of
+         * 32 tiles cost 1.33x on identical units). */
+        if (weighted_ && state->worker_count > 0 &&
+            chunks <= 2 * (state->worker_count + 1)) {
+            const uint32_t units = state->worker_count + 1;
+            std::vector<float> w(units, 1.0f);
+            for (uint32_t u = 0; u < units && u < unit_weights_.size(); ++u)
+                if (unit_weights_[u] > 0.0f) w[u] = unit_weights_[u];
+            double total = 0.0;
+            for (float x : w) total += x;
+            for (uint32_t u = 1; u < units; ++u) {
+                double before = 0.0, after = 0.0;
+                for (uint32_t i = 0; i < units; ++i) {
+                    if (i < u) before += w[i];
+                    if (i <= u) after += w[i];
+                }
+                uint64_t lo = static_cast<uint64_t>(
+                    (before / total) * static_cast<double>(n));
+                uint64_t hi = (u + 1 == units) ? n
+                    : static_cast<uint64_t>((after / total) *
+                                            static_cast<double>(n));
+                /* Worker ids stay in [0, worker_count) so the issuing thread
+                 * keeps owning id worker_count; otherwise the two collide on
+                 * the per-unit Cell scratch buffer. */
+                enqueue([state, &fn, u, lo, hi]() {
+                    try {
+                        if (lo < hi) fn(lo, hi, u - 1);
+                    } catch (...) {
+                        std::lock_guard<std::mutex> guard(state->error_mutex);
+                        if (!state->first_error)
+                            state->first_error = std::current_exception();
+                    }
+                    state->workers_done.fetch_add(1,
+                        std::memory_order_acq_rel);
+                    state->wait_cv.notify_all();
+                });
+            }
+            /* hi(u-1) and lo(u) are the same expression, so truncation can
+             * never open a gap between the issuer's range and the workers'. */
+            uint64_t c_hi = (units == 1) ? n : static_cast<uint64_t>(
+                (static_cast<double>(w[0]) / total) * static_cast<double>(n));
+            if (c_hi > 0) {
+                try {
+                    fn(0, c_hi, state->worker_count);
+                } catch (...) {
+                    std::lock_guard<std::mutex> guard(state->error_mutex);
+                    if (!state->first_error)
+                        state->first_error = std::current_exception();
+                }
+            }
+            std::unique_lock<std::mutex> lock(state->wait_mutex);
+            state->wait_cv.wait(lock, [&]() {
+                return state->workers_done.load(std::memory_order_acquire) ==
+                       state->worker_count;
+            });
+            if (state->first_error)
+                std::rethrow_exception(state->first_error);
+            return;
+        }
 
         for (uint32_t w = 0; w < state->worker_count; ++w) {
             enqueue([state, &fn, w]() {
@@ -262,6 +386,28 @@ public:
                 state->wait_cv.notify_all();
             });
         }
+        /* The issuing thread drains chunks too: it starts on real work at once
+         * instead of blocking on a condvar wake. */
+        for (;;) {
+            uint64_t begin = state->next.fetch_add(state->grain,
+                                                  std::memory_order_relaxed);
+            if (begin >= state->n) break;
+            uint64_t end = std::min<uint64_t>(state->n, begin + state->grain);
+            try {
+                fn(begin, end, state->worker_count);
+            } catch (...) {
+                std::lock_guard<std::mutex> guard(state->error_mutex);
+                if (!state->first_error)
+                    state->first_error = std::current_exception();
+                state->remaining.fetch_sub(1, std::memory_order_acq_rel);
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> guard(state->wait_mutex);
+                state->remaining.fetch_sub(1, std::memory_order_acq_rel);
+            }
+            state->wait_cv.notify_all();
+        }
         std::unique_lock<std::mutex> lock(state->wait_mutex);
         state->wait_cv.wait(lock, [&]() {
             return state->remaining.load(std::memory_order_acquire) == 0 &&
@@ -273,13 +419,21 @@ public:
 
 private:
     void worker_loop(uint32_t index);
+    /* Try to take a task without sleeping.  Returns false after the spin
+     * budget is spent, leaving the caller to block on the condvar. */
+    bool spin_for_task(std::function<void()> &task);
 
     std::vector<std::thread> workers_;
     std::deque<std::function<void()>> tasks_;
-    mutable std::mutex mutex_;
+    mutable    std::mutex mutex_;
     std::condition_variable cv_;
     bool stopping_ = false;
     bool pin_threads_ = false;
+    std::vector<float> unit_weights_;
+    bool weighted_ = false;
+    /* Mirrors tasks_.size() so the lease spin can poll without the mutex. */
+    std::atomic<uint32_t> pending_tasks_{0};
+    std::atomic<uint32_t> lease_depth_{0};
 };
 
 /* ------------------------------------------------------------------------- */
@@ -379,6 +533,7 @@ struct GemmF32Params {
     uint32_t unit = 0;
     uint32_t isa = ISA_SCALAR;
     uint32_t tile_m = 0, tile_k = 0, tile_n = 0;
+    bool pack_b = true;
     const uint8_t *tile_mask = nullptr;
     uint32_t mask_tile_m = 0, mask_tile_n = 0;
     const std::vector<TileJob> *tiles = nullptr;
@@ -409,6 +564,9 @@ struct GemmI8Params {
     uint32_t isa = ISA_SCALAR;
     bool has_vnni = false;
     uint32_t tile_m = 0, tile_k = 0, tile_n = 0;
+    /* Panel-packed B for the AVX2 path (VNPU_PACK=0 selects the row-major
+     * reads, which is the A/B control). */
+    bool pack_b = true;
     PackedI8View B;
     const std::vector<TileJob> *tiles = nullptr;
     std::vector<std::vector<uint8_t>> *local_stores = nullptr;
@@ -544,6 +702,13 @@ struct vnpu_device {
     std::atomic<uint32_t> tile_m{0};
     std::atomic<uint32_t> tile_k{0};
     std::atomic<uint32_t> tile_n{0};
+    /* Panel-packed f32 NN path (see kernels.cpp pack_b_panel).  VNPU_PACK=0
+     * disables it, which exists so the two structures can be A/B measured on
+     * the same binary. */
+    bool pack_b = true;
+    /* Hold the thread pool hot for the duration of a submitted batch
+     * (VNPU_LEASE=0 disables, for A/B measurement). */
+    bool batch_lease = true;
     std::vector<std::vector<uint8_t>> local_stores;
     std::vector<vnpu_stream_t *> streams;
     vnpu_interrupt_cb_t irq_cb = nullptr;
@@ -554,7 +719,8 @@ struct vnpu_device {
     std::string trace_file;
 
     uint32_t isa() const { return cpu.isa; }
-    bool has_vnni() const { return (cpu.bits & VNPU_FEATURE_AVX512VNNI) != 0; }
+    /* No VNNI kernel is compiled: AVX2+FMA (Zen 3) is the top rung. */
+    bool has_vnni() const { return false; }
     void raise_irq(uint32_t bits);
 };
 

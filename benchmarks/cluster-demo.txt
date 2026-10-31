@@ -1,8 +1,8 @@
 === Two-node virtual NPU cluster demo ===
 shape=256x256x256 ports=19550,19551 token=bench
-vnpu-node draft-node listening on 127.0.0.1:19550 | AVX512F+VNNI | 2 threads | auth=token
-vnpu-node verify-node listening on 127.0.0.1:19551 | AVX512F+VNNI | 2 threads | auth=token
-local  :   4.7208 ms     7.108 GFLOP/s
-cluster:   5.4629 ms     6.142 GFLOP/s  speedup=0.86x
+vnpu-node verify-node listening on 127.0.0.1:19551 | AVX2+FMA | 2 threads | auth=token
+vnpu-node draft-node listening on 127.0.0.1:19550 | AVX2+FMA | 2 threads | auth=token
+local  :   0.6430 ms    52.183 GFLOP/s
+cluster:   1.0884 ms    30.830 GFLOP/s  speedup=0.59x
 correct: YES
-cluster-all stats: jobs=5 local=0 remote=10 sent=1835888 B recv=1311104 B failed=0 speedup=1.35x
+cluster-all stats: jobs=5 local=0 remote=10 sent=1835888 B recv=1311104 B failed=0 speedup=1.90x

@@ -25,9 +25,9 @@ implementing a full model/tokenizer, or depending on a vendor SDK.
         +----------------+----------------+----------------+
         v
   Kernel dispatcher (runtime CPUID)
-        +---------+---------+---------+---------+
-        | scalar  | AVX2    | AVX512  | VNNI    |
-        +---------+---------+---------+---------+
+        +---------+---------+---------+
+        | scalar  | AVX2    | NEON    |
+        +---------+---------+---------+
         v
   Persistent thread pool + per-worker local store
         |
@@ -115,27 +115,63 @@ cull mask is present, otherwise Voodoo.
 
 `A[M,K] * B[K,N] -> C[M,N]`.
 
-- AVX-512: 4 rows × 16 columns in registers, one B vector per K, four FMA
-  accumulators.
-- AVX2: 4 rows × 8 columns.
+- AVX2: 3 rows × 32 columns in registers — twelve accumulators, three
+  broadcasts and one live B vector, which is exactly the 16 architectural YMM
+  registers. Eight accumulators (the old 4×8 block) cannot hide a 5-cycle FMA
+  latency across two ports.
+- AVX2, packed B: each tile copies its columns into a `[kc][tn]` panel
+  (`kc=128, tn=64` → 32 KiB, L1-resident) and the microkernel walks the panel
+  sequentially instead of striding row-major K×N. Tiles go full-height
+  (`tm = M`) when N alone gives the units enough tiles, so B is packed once.
+  `VNPU_PACK=0` selects the unpacked path for A/B measurement.
+- AVX2, M≤8 (decode): one row at a time with K outermost, so B is walked
+  linearly and the prefetcher sees one run rather than a cache line per column.
+  Rows left over from the 2-row block use the same path.
+- AVX2, M=2 and M=3 int8 over a wide slice: the rows of the tile are staged as
+  `int32` (4 bytes per column each) and B is swept once for all of them, so
+  every B byte feeds R FMAs. R=4 was measured and is worse than the packed
+  panel (four staged rows thrash L1), so M≥4 keeps the panel.
 - NEON: 4 rows × 4 columns.
 - Scalar: correctness oracle and fallback.
-- Tails and transposed A fall back to scalar tiles.
+- Transposed A falls back to scalar tiles.
+
+There is no AVX-512 path in this build; `ISA_AVX512` remains in the enum only
+because the public ABI and the NEON/LLM operator code share it, and runtime
+detection never selects it.
 
 ### F32 NT (transposed B)
 
 For decode, weights are often `[N,K]`. A vectorized dot-product kernel streams
 both A and B rows contiguously and horizontally reduces one accumulator.
 
-### INT8 VNNI
+### Kernel scratch ownership
+
+Kernel scratch (the packed panel, the CELL staging buffers) is `thread_local`,
+not a per-worker-device buffer. A `parallel_for` worker id is a *task* slot, not
+a thread: two streams on one device run two `parallel_for` calls concurrently,
+so two tasks carrying the same slot index can land on different threads. Measured
+with two concurrent streams on a 512³ F32 GEMM before the fix: 10 of 12 runs
+returned wrong results. `selftest concurrent_streams_same_device` covers it, and
+fails if the scratch stops being per-thread.
+
+### INT8 (AVX2)
 
 - symmetric per-row activation scales, per-column weight scales;
-- weights packed as `[N/16][K/4][16][4]` signed bytes;
-- activations converted to `u8 = i8 + 128`;
-- `_mm512_dpbusd_epi32` accumulates 4 products per 32-bit lane;
-- precomputed `sum(B)` removes the `128 * sum(B)` bias;
-- 4 M rows and up to 4 N blocks (64 columns) are processed together;
-- for K ≥ 512 and wide N, broadcast-A vectors are precomputed in local store.
+- 2 rows × 32 columns per block: eight int32 accumulators plus the operand
+  vectors fit the 16 YMM registers;
+- without VNNI there is no int8 dot-product instruction, so the only exact and
+  vectorisable axis on row-major B is the column axis: broadcast one A value
+  and multiply eight contiguous B bytes (`cvtepi8_epi32` + `mullo_epi32`);
+- rows left over from the 2-row block, including the whole tile when decode
+  makes `tm==1`, take the same single-row path rather than the scalar kernel;
+- B is **panel-packed** per tile into `[k][tn]` for the whole K at once (64 KiB
+  at `tn=64, K=1024`), which keeps the int32 accumulators in registers and makes
+  the packed result bit-identical to the row-major one. Tiles with `tm < 3` skip
+  packing: a single row reads every panel entry once, so copying it is pure
+  overhead. That is the decode shape, which stays row-major;
+- weights can still be packed as `[N/16][K/4][16][4]`, but that layout is
+  VNNI-shaped: the AVX2 kernel consumes the row-major copy, and the tile-time
+  `[k][tn]` panel above is what the kernel actually reads now.
 
 ## 8. Transformer operators
 

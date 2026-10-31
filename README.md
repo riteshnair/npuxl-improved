@@ -20,7 +20,7 @@ It is deliberately called a *virtual* NPU: it is not pretending to be a physical
 NPU, and it does not bypass the CPU. It gives an engine a device-like contract —
 streams, buffers, command packets, doorbells, interrupts, status registers,
 completion events, DMA and telemetry — while mapping the work onto AVX2/FMA,
-AVX-512/VNNI, NEON or scalar CPU kernels.
+AArch64 NEON or scalar CPU kernels.
 
 ---
 
@@ -134,15 +134,20 @@ Kernels use runtime dispatch:
 
 | CPU | Path |
 |---|---|
-| AVX-512 VNNI | 4-row × 64-column INT8 microkernel with broadcast-A reuse |
-| AVX-512F | 4×16 F32 FMA microkernel and vectorized transformer ops |
-| AVX2/FMA | 4×8 F32 microkernel and AVX2 INT8 fallback |
+| AVX2/FMA (Zen 3 baseline) | 3-row × 32-column F32 microkernel (12 accumulators, 16 YMM) and a column-blocked AVX2 INT8 microkernel |
+| AVX2/FMA, M≤8 | streaming GEMV: K outermost so B is walked linearly |
 | AArch64 NEON | 4×4 F32 microkernel |
 | Generic | scalar correctness path |
 
 All ISA-specific functions are compiled with target attributes, so a single
-binary runs on machines without AVX-512. `VNPU_FORCE_ISA=scalar|avx2|avx512`
-can downgrade dispatch for debugging or sanitizer builds.
+binary also runs on machines without AVX2. `VNPU_FORCE_ISA=scalar|avx2` can
+downgrade dispatch for debugging or sanitizer builds; any other value is
+ignored with a log line rather than executed.
+
+There is **no AVX-512 or VNNI kernel in this build**. Those paths were removed:
+they could not be verified on the target hardware (a 4×8 hybrid laptop and a Zen
+3 desktop, neither with AVX-512) and wide-vector code downclocked the laptop.
+INT8 runs on AVX2, where the only exact vectorisation axis is the column axis.
 
 ---
 
@@ -244,32 +249,85 @@ sidecar. See `docs/CLUSTER.md`.
 
 ## Measured performance
 
-Sandbox: 2 logical Intel Xeon vCPUs, AVX-512F + AVX-512 VNNI, GCC 14, `-O3`,
-`make benchmark`. These numbers compare against a naive scalar triple-loop
-baseline in the same binary; they are **not** a claim against optimized BLAS.
-The VM is noisy, so `benchmarks/*.json` is the source of truth for a given run.
+Sandbox: 2 physical cores (1 thread/core), AVX2+FMA, 2 units, GCC, `-O3`,
+`make benchmark`. The default unit count is **physical cores**, not logical
+CPUs: SMT siblings share the L1/L2 these kernels depend on, so a 14c/18t hybrid
+laptop gets 14 units. Override with `cfg.num_threads` or `--threads`.
 
-### Dense GEMM, 512×512×512
+A speedup here is against the **faster of two plain-C references** measured in
+the same binary: the naive scalar triple loop, and the same arithmetic written
+in the loop order the compiler can auto-vectorise (no intrinsics, no blocking,
+best of 3 after warm-up). Earlier revisions quoted factors up to 85× against a
+single-shot baseline with a volatile store inside the loop; those numbers were
+measuring the reference, not the kernels, and are gone. These are **not** a
+claim against optimised BLAS.
 
-| Path | Time | Throughput | Speedup vs scalar |
-|---|---:|---:|---:|
-| Naive scalar baseline | ~168–205 ms | ~1.3 GFLOP/s | 1.0× |
-| F32 Wildcat (`bench`) | 2.69 ms | 99.8 GFLOP/s | 59.1× |
-| F32 Voodoo (`bench`) | 3.16 ms | 85.0 GFLOP/s | 50.3× |
-| INT8 AUTO (`bench`) | 3.15 ms | 85.2 GFLOP/s | 50.5× |
-| Autotuned F32 | 4.38 ms | 61.3 GFLOP/s | 38.3× |
-| Autotuned INT8 VNNI | 2.02 ms | 132.8 GFLOP/s | 85.5× |
+The VM is noisy — the same binary has measured 80–101 GFLOP/s at 512³ F32 — so
+`benchmarks/*.json` is the source of truth for a given run. Best unit per row:
 
-Other representative results from the final run:
+| Shape | dtype | Time | Throughput | vs plain C |
+|---|---:|---:|---:|---:|
+| 128×128×128 | F32 | 0.096 ms | 43.8 GFLOP/s | 2.15× |
+| 128×128×128 | INT8 | 0.075 ms | 55.7 GFLOP/s | 2.74× |
+| 256×256×256 | F32 | 0.446 ms | 75.2 GFLOP/s | 3.70× |
+| 256×256×256 | INT8 | 0.358 ms | 93.7 GFLOP/s | 4.61× |
+| 512×512×512 | F32 | 2.79 ms | 96.1 GFLOP/s | 4.66× |
+| 512×512×512 | INT8 | 2.61 ms | 102.8 GFLOP/s | 4.98× |
+| 1024×1024×1024 | F32 | 19.2 ms | 111.9 GFLOP/s | 5.56× |
+| 1024×1024×1024 | INT8 | 18.2 ms | 117.9 GFLOP/s | 5.85× |
+| 1×4096×4096 (decode) | F32 | 2.96 ms | 11.3 GFLOP/s | 1.26× |
+| 1×4096×4096 (decode) | INT8 | 1.03 ms | 32.5 GFLOP/s | 3.76× |
 
-- 256³ F32 Wildcat: 0.528 ms, 63.5 GFLOP/s, 34.6×;
-- 256³ INT8 Wildcat: 0.443 ms, 75.8 GFLOP/s, 41.3×;
-- 128³ F32 Wildcat: 0.199 ms, 21.0 GFLOP/s, 12.8×.
+Read this honestly. Prefill-shaped work is 1.6–6× a compiler-vectorised loop.
+**Decode F32 is a parity win at best**: 1.26× against a plain `-O3` loop,
+because a single row against a 67 MB matrix is pure memory bandwidth and both
+sides read the same bytes. INT8 decode is the strongest ratio in the table: it
+halves those bytes *and* streams them, and at 16.3 GB/s it runs at 82% of its
+2 flop/byte roofline. It was 1.76× until the decode tile width and the int8
+row kernel were fixed; `docs/PERFORMANCE.md` has the measurements.
 
-The original 12–20× goal is exceeded for medium/large GEMMs on this CPU-only
-VM. Tiny decode-shaped GEMMs are dominated by dispatch and memory latency; use
-`CELL`, fuse operators, keep weights packed, or use cluster/speculative
-batching.
+Both dtypes are **panel-packed**: each tile copies its columns into a `[kc][tn]`
+panel sized to L1 and the microkernel walks that contiguous panel instead of
+striding a row-major K×N matrix. Measured on the same binary with
+`VNPU_PACK=0` as the control (medians, interleaved rounds):
+
+| Shape | F32 | INT8 |
+|---|---:|---:|
+| 256³ | 0.433 → 0.399 ms (+8%) | 0.431 → 0.415 ms (+4%, within noise) |
+| 512³ | 3.275 → 3.104 ms (+5%) | 3.221 → 2.909 ms (+10%) |
+| 1024³ | 36.4 → 21.7 ms (**+68%**) | 25.6 → 19.2 ms (**+33%**) |
+
+The win grows with the working set, as the strip-traffic model predicts. F32
+uses K blocking (`kc=128`); INT8 panels are 4× smaller, so the whole K fits in
+the worker's local store and the int32 accumulators never leave registers --
+which makes packed and unpacked INT8 **bit-identical**, and the conformance run
+asserts exactly that. Decode (M=1) is untouched by design: a single row reads
+each panel entry once, so packing it would be a pure copy.
+
+### Conformance and reference mode
+
+"Same answer everywhere" is tested, not asserted: `make conformance` runs every
+unit, thread count, B structure (packed and unpacked) and transposition over
+five shapes against an **independent plain-C reference written in double
+precision**, and checks two invariance properties a caller can rely on:
+
+- **unit-count invariance** — the same GEMM produces bit-identical bytes on 1
+  unit and on 2, because each output element accumulates over the whole K
+  inside one tile;
+- **INT8 exactness** — integer accumulation makes INT8 results bit-identical
+  across every unit and thread count.
+
+Current run: 10 checks, 0 failures. F32 worst relative error against the
+double-precision reference is **9.2e-07** (tolerance 1e-4). Packing B changes
+the K-block summation order, so packed and unpacked results agree to that
+tolerance but are *not* bit-identical — the invariance checks are made within
+one structure, and the docs say so rather than pretending otherwise.
+
+`VNPU_MODE=reference` forces the simplest path the library can produce (scalar
+kernels, unpacked B, no pool lease). It is the equivalent of running a graphics
+app on a software rasterizer: if a bug still reproduces here, it is the
+caller's, not a fast-kernel or dispatch bug. The conformance run checks that
+this mode agrees with the plain-C reference too (rel err 2–4e-07).
 
 ### Synthetic transformer block
 
@@ -277,8 +335,8 @@ batching.
 
 | Phase | F32 | INT8 |
 |---|---:|---:|
-| prefill 32 tokens | 1,959 tok/s, 25.0 GFLOP/s | 2,741 tok/s, 35.0 GFLOP/s |
-| decode 1 token | 88.4 tok/s | 96.0 tok/s |
+| prefill 32 tokens | 4,098 tok/s, 52.4 GFLOP/s | 4,301 tok/s, 55.0 GFLOP/s |
+| decode 1 token | 758 tok/s, 9.6 GFLOP/s | 722 tok/s, 9.1 GFLOP/s |
 
 This is a realistic op mix (RMSNorm, RoPE, attention, QKV/O/gate-up/down GEMMs,
 SwiGLU), not a tokenizer or sampling engine.
@@ -302,7 +360,9 @@ src/core/                 runtime, scheduler, autotune, backend table
 src/kernels/              SIMD GEMM + transformer kernels
 src/cluster/              sockets, node server, cluster, speculation
 src/compat/               PCem-free virtual_npu/vgpu_npu implementation
-tools/                    CLI, node, selftest, demos, LLM benchmark
+tools/                    CLI, node, selftest, demos, LLM benchmark, bench_matrix
+                          (tools/laptop/ is a separate Meteor Lake prototype and is
+                          not built by make or CMake)
 bindings/python/          ctypes wrapper
 examples/                 dynamic loader and engine integration examples
 tests/                    fuzz/property tests
@@ -350,7 +410,8 @@ See `docs/ROADMAP.md` for the full plan.
 MIT. See `LICENSE`.
 
 **Honest note:** a virtual NPU cannot create compute that the CPU does not have.
-The gains come from removing the emulator, keeping data resident, using SIMD and
-VNNI, batching commands, culling empty work, and overlapping local/remote
-workers. Measure against your own model and baseline; the benchmarking and
-tracing tools are included specifically for that.
+The gains come from removing the emulator, keeping data resident, using SIMD,
+batching commands, culling empty work, and overlapping local/remote workers.
+Measure against your own model and a baseline you trust — the benchmarking and
+tracing tools are included specifically for that, and `vnpu-cli bench` now
+reports the plain-C reference times next to each result.

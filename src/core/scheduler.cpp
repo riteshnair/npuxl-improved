@@ -50,22 +50,134 @@ static uint32_t choose_unit(const vnpu_device_t *device,
     if (a.unit != VNPU_UNIT_AUTO) return a.unit;
     if (a.tile_mask || (flags & VNPU_CMD_FLAG_WILDCAT_CULL))
         return VNPU_UNIT_WILDCAT;
-    if ((device->config.flags & VNPU_CONFIG_LOW_LATENCY) || a.M <= 4)
-        return VNPU_UNIT_CELL;
-    if (device->config.flags & VNPU_CONFIG_HIGH_THROUGHPUT)
-        return VNPU_UNIT_VOODOO;
-    if (a.K <= 256 && a.N <= 2048)
-        return VNPU_UNIT_CELL;
+    /* CELL is never chosen automatically.  Its staged local-store loop is
+     * single-threaded scalar, and it measured 0.3-0.6x a plain -O3 loop for
+     * every shape tested, including the tiny decode shapes (M<=4) and small
+     * K,N shapes it used to be selected for.  It stays available as an
+     * explicit unit. */
     return VNPU_UNIT_VOODOO;
 }
 
+/* Widest useful column tile for the M=1 decode path, in columns.
+ *
+ * The rank-1 decoder stages one int32 accumulator per column of the tile (4
+ * bytes) and re-reads that staging row on every k step, so it competes with the
+ * B stream for L2.  Giving it half of L2 is what the measurements support,
+ * 2 threads, int8, best of 7 interleaved cells:
+ *
+ *   K=64, N=262144:   65536 cols 0.86 ms (19.6 GB/s)   131072 cols 1.86 ms
+ *                     (9.0 GB/s)   whole row 3.50 ms (4.8 GB/s)
+ *   K=64, N=1048576:  65536 cols 3.59 ms (18.7 GB/s)  524288 cols 9.0 ms
+ *
+ * 4 bytes x 131072 = 512 KiB is the whole of this L2, and the staging row then
+ * thrashes against the stream; at 256 KiB it still fits alongside it.  The
+ * scratch buffer is the second limit: the kernel falls back to the old blocked
+ * walk if the staging row does not fit VNPU_LOCAL_STORE_BYTES. */
+static uint32_t decode_max_tile_columns(const vnpu_device_t *device,
+                                       uint32_t rows)
+{
+    uint64_t l2 = device->info.l2_bytes ? device->info.l2_bytes
+                                        : (512ull * 1024ull);
+    /* Each staged accumulator row costs sizeof(int32_t) per column and they all
+     * have to share half of L2 with the B stream, so the column budget divides
+     * by the row count. */
+    uint64_t cols = l2 / (2ull * sizeof(int32_t) * rows);
+    /* thread_scratch() hands out VNPU_LOCAL_STORE_BYTES + one cache line, so a
+     * staging row of exactly VNPU_LOCAL_STORE_BYTES still fits after alignment. */
+    const uint64_t scratch_cols =
+        (uint64_t)VNPU_LOCAL_STORE_BYTES / (sizeof(int32_t) * rows);
+    if (cols > scratch_cols) cols = scratch_cols;
+    cols &= ~(uint64_t)31u;
+    if (cols < 256u) cols = 256u;
+    if (cols > 0x7fffffffu) cols = 0x7fffffffu;
+    return static_cast<uint32_t>(cols);
+}
+
 static void tile_geometry(const vnpu_device_t *device, uint32_t unit,
-                          uint32_t M, uint32_t N,
+                          uint32_t M, uint32_t N, bool int8,
                           uint32_t &tm, uint32_t &tk, uint32_t &tn)
 {
     tm = std::max<uint32_t>(1, device->tile_m.load());
     tk = std::max<uint32_t>(1, device->tile_k.load());
     tn = std::max<uint32_t>(1, device->tile_n.load());
+    /* Decode (M<=8): one row block already covers all of M, so N is the only
+     * axis that can be spread across units.  Keeping the prefill tile width
+     * here gave a handful of very wide tiles, i.e. one unit did the token. */
+    if (M <= 8 && (unit == VNPU_UNIT_VOODOO || unit == VNPU_UNIT_AUTO)) {
+        tm = M;
+        /* From M=4 up the column strip is reused by every row of the tile, so
+         * it has to stay small enough to live in L2 and the narrow tile is
+         * kept: the wide split dropped 4x4096x4096 int8 from 36 to 21 GFLOP/s,
+         * and re-measuring with the rank-R stream confirmed it -- four staged
+         * rows cost 1.98 -> 2.32 ms there.  Only one to three rows have no
+         * reuse partner. */
+        if (M > 3) {
+            tn = std::min<uint32_t>(std::max<uint32_t>(32, tn), 64);
+            if (tn > N) tn = N;
+            return;
+        }
+        /* Two rows are the awkward middle: too many accumulators to keep a wide
+         * column block in registers, too few to amortise the packed panel that
+         * M>=3 uses.  With the 64-column tile they re-read B as strided 64-byte
+         * runs, which measured 1.50 ms at 2x4096x4096 int8 against 0.65 ms for
+         * one row.  The int8 kernel stages both int32 rows instead, so the same
+         * width rule applies with half the column budget per row.
+         *
+         * That stream doubles the accumulator traffic, so it only pays while a
+         * unit still owns a long run: 2x4096x4096 (2048 columns each) went 1.63
+         * -> 1.05 ms, but 2x4096x1024 (512 columns each) went 0.28 -> 0.53 ms
+         * and keeps the narrow tile.  The f32 kernel has no such stream, and a
+         * wide tile there cost 4.9 -> 6.0 ms at 2x4096x4096. */
+        const uint32_t units = std::max<uint32_t>(1, device->info.num_threads);
+        if (M <= 3 && (!int8 || N / units < 1024u)) {
+            tn = std::min<uint32_t>(std::max<uint32_t>(32, tn), 64);
+            if (tn > N) tn = N;
+            return;
+        }
+        /* A single row touches every weight byte exactly once, so the column
+         * tile width decides whether B is read as a stream or as a stride-N
+         * walk.  One contiguous slice of N per unit is the rule, and every
+         * weight byte is then read once, in order, at the longest run of
+         * columns that unit's share of N allows: 1x4096x4096 int8, 2 threads,
+         * best of 7 interleaved rounds, 2048 cols (one slice each) 0.99 ms,
+         * 4096 cols (one tile, a unit left idle) 1.13, 1024 cols 1.18, 512 cols
+         * 1.20, and the old fixed 64 cols 2.85 ms.
+         *
+         * Two limits shape it.  A slice narrower than 256 columns is not worth
+         * a second unit, because the run per row gets too short to pay for it:
+         * 1x4096x128 and 1x4096x256 both measured faster unsplit (0.053 vs
+         * 0.063 ms and 0.069 vs 0.078).  And a tile may not exceed what L2 can
+         * hold next to the stream, see decode_max_tile_columns; when that limit
+         * binds, the tile count is rounded up to a multiple of units so the
+         * share stays even. */
+        const uint32_t rows = M;
+        uint32_t tiles = std::min<uint32_t>(units, std::max<uint32_t>(1, N / 256u));
+        const uint32_t cap = decode_max_tile_columns(device, rows);
+        if (ceil_div_u32(N, tiles) > cap) {
+            tiles = ceil_div_u32(N, cap);
+            /* Once the cache limit forces extra tiles, round their count up to a
+             * multiple of units so every unit gets the same number of them: five
+             * tiles over two units (3+2) measured 1.22 ms on K=64,N=262144 int8
+             * against 0.99 ms for four (2+2). */
+            tiles = ceil_div_u32(tiles, units) * units;
+        }
+        uint32_t wide = (ceil_div_u32(N, tiles) + 31u) & ~31u;
+        tn = std::min<uint32_t>(N, std::max<uint32_t>(1, wide));
+        return;
+    }
+    /* Panel-packed path: one tile spans all of M so its B panel is packed once
+     * for the whole GEMM instead of once per M tile.  Only when N alone gives
+     * the units enough tiles to stay busy. */
+    if (device->pack_b &&
+        (unit == VNPU_UNIT_VOODOO || unit == VNPU_UNIT_AUTO)) {
+        const uint32_t units = std::max<uint32_t>(1, device->info.num_threads);
+        const uint32_t nt64 = ceil_div_u32(N, 64);
+        if (M >= 3 && nt64 >= 2 * units) {
+            tm = M;
+            tn = 64;
+            return;
+        }
+    }
     switch (unit) {
     case VNPU_UNIT_WILDCAT:
         tm = std::min<uint32_t>(tm, 32);
@@ -99,11 +211,12 @@ static vnpu_status_t build_tiles_generic(const vnpu_device_t *device,
                                          const uint8_t *tile_mask,
                                          uint32_t mask_tile_m,
                                          uint32_t mask_tile_n,
+                                         bool int8,
                                          std::vector<TileJob> &tiles)
 {
     if (!device || !M || !N) return VNPU_ERR_INVALID_ARGUMENT;
     uint32_t tm, tk, tn;
-    tile_geometry(device, unit, M, N, tm, tk, tn);
+    tile_geometry(device, unit, M, N, int8, tm, tk, tn);
     uint32_t mt = ceil_div_u32(M, tm);
     uint32_t nt = ceil_div_u32(N, tn);
     tiles.clear();
@@ -155,7 +268,7 @@ vnpu_status_t build_gemm_tiles(vnpu_device_t *device,
     uint32_t unit = choose_unit(device, args, 0);
     return build_tiles_generic(device, args.M, args.N, unit,
                                args.tile_mask, args.mask_tile_m,
-                               args.mask_tile_n, tiles);
+                               args.mask_tile_n, false, tiles);
 }
 
 static vnpu_status_t prepare_matmul_f32(const vnpu_matmul_f32_args_t &in,
@@ -194,6 +307,7 @@ static vnpu_status_t prepare_matmul_f32(const vnpu_matmul_f32_args_t &in,
     p.tile_m = device->tile_m.load();
     p.tile_k = device->tile_k.load();
     p.tile_n = device->tile_n.load();
+    p.pack_b = device->pack_b;
     p.tile_mask = in.tile_mask;
     p.mask_tile_m = in.mask_tile_m;
     p.mask_tile_n = in.mask_tile_n;
@@ -213,7 +327,7 @@ static void execute_matmul_f32(ExecCtx &ctx)
     std::vector<TileJob> tiles;
     rc = build_tiles_generic(ctx.device, in.M, in.N, unit,
                              in.tile_mask, in.mask_tile_m,
-                             in.mask_tile_n, tiles);
+                             in.mask_tile_n, false, tiles);
     if (rc != VNPU_OK) throw std::runtime_error(vnpu_status_string(rc));
     p.tiles = &tiles;
     uint64_t active_tiles = 0;
@@ -268,7 +382,8 @@ static void execute_matmul_i8(ExecCtx &ctx)
                                nullptr, 0, 0}, ctx.flags);
     if (unit == VNPU_UNIT_GPU) throw std::runtime_error("GPU backend not enabled");
     std::vector<TileJob> tiles;
-    build_tiles_generic(ctx.device, in.M, in.N, unit, nullptr, 0, 0, tiles);
+    build_tiles_generic(ctx.device, in.M, in.N, unit, nullptr, 0, 0, true,
+                        tiles);
     GemmI8Params p;
     p.A = in.A;
     p.scale_a = in.scale_a;
@@ -282,10 +397,11 @@ static void execute_matmul_i8(ExecCtx &ctx)
     p.epilogue = in.epilogue;
     p.unit = unit;
     p.isa = ctx.device->cpu.isa;
-    p.has_vnni = ctx.device->has_vnni();
+    p.has_vnni = false;   /* no VNNI path is built */
     p.tile_m = ctx.device->tile_m.load();
     p.tile_k = ctx.device->tile_k.load();
     p.tile_n = ctx.device->tile_n.load();
+    p.pack_b = ctx.device->pack_b;
     p.B = make_packed_view(w);
     p.tiles = &tiles;
     p.local_stores = &ctx.device->local_stores;

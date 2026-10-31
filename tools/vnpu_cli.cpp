@@ -34,6 +34,23 @@ struct Shape {
     }
 };
 
+/* A flat per-dimension cap rejected the shapes we care about most while still
+ * admitting bad ones: it refused 1x64x262144, a decode row whose matrices are a
+ * few hundred megabytes in total, and accepted 16384x16384x16384, which needs
+ * several gigabytes.  Bound the f32 working set instead: A, B, C and the scalar
+ * baseline copy. */
+static bool shape_fits_memory(const Shape &s)
+{
+    const uint64_t mk = static_cast<uint64_t>(s.M) * s.K;
+    const uint64_t kn = static_cast<uint64_t>(s.K) * s.N;
+    const uint64_t mn = static_cast<uint64_t>(s.M) * s.N;
+    /* Sample checks index with 32-bit products, and so do several kernels. */
+    if (mk > 0xffffffffull || kn > 0xffffffffull || mn > 0xffffffffull)
+        return false;
+    const uint64_t bytes = sizeof(float) * (mk + kn + 2 * mn);
+    return bytes <= (1ull << 30);
+}
+
 Shape parse_shape(const char *s)
 {
     Shape out;
@@ -41,7 +58,7 @@ Shape parse_shape(const char *s)
     char x = 0;
     if (std::sscanf(s, "%u%c%u%c%u", &out.M, &x, &out.K, &x, &out.N) != 5)
         return Shape{};
-    if (out.M > 16384 || out.K > 16384 || out.N > 16384) return Shape{};
+    if (!shape_fits_memory(out)) return Shape{};
     return out;
 }
 
@@ -98,7 +115,9 @@ struct BenchResult {
     uint32_t iterations = 0;
     double ms = 0.0;
     double gflops = 0.0;
-    double baseline_ms = 0.0;
+    double baseline_ms = 0.0;      /* faster plain-C loop (no intrinsics) */
+    double baseline_scalar_ms = 0.0;
+    double baseline_compiler_ms = 0.0;
     double speedup = 0.0;
     uint64_t bytes_read = 0;
     uint64_t bytes_written = 0;
@@ -140,25 +159,66 @@ bool check_samples(const std::vector<float> &C,
     return true;
 }
 
+/* Keeps the baseline loops from being optimised away without putting a
+ * volatile store inside the measured loop. */
+volatile float g_bench_sink = 0.0f;
+
+/* Naive scalar triple loop: no intrinsics, no blocking, the textbook m-n-k
+ * order with B walked by rows of stride N.  Timed as the best of three runs
+ * after a warm-up; the previous version took a single sample and put a volatile
+ * store inside the loop, so it was timing the volatile pipeline as much as the
+ * arithmetic. */
 double scalar_baseline(const std::vector<float> &A,
                        const std::vector<float> &B,
                        std::vector<float> &C,
                        uint32_t M, uint32_t K, uint32_t N)
 {
-    double t0 = now_ms();
-    volatile float sink = 0.0f;
-    for (uint32_t m = 0; m < M; ++m) {
-        for (uint32_t n = 0; n < N; ++n) {
-            float acc = 0.0f;
-            for (uint32_t k = 0; k < K; ++k)
-                acc += A[static_cast<size_t>(m) * K + k] *
-                       B[static_cast<size_t>(k) * N + n];
-            C[static_cast<size_t>(m) * N + n] = acc;
-            sink += acc;
+    double best = 1e30;
+    for (uint32_t rep = 0; rep < 3; ++rep) {
+        float sink = 0.0f;
+        double t0 = now_ms();
+        for (uint32_t m = 0; m < M; ++m) {
+            for (uint32_t n = 0; n < N; ++n) {
+                float acc = 0.0f;
+                for (uint32_t k = 0; k < K; ++k)
+                    acc += A[static_cast<size_t>(m) * K + k] *
+                           B[static_cast<size_t>(k) * N + n];
+                C[static_cast<size_t>(m) * N + n] = acc;
+                sink += acc;
+            }
         }
+        g_bench_sink = sink;
+        best = std::min(best, now_ms() - t0);
     }
-    (void)sink;
-    return now_ms() - t0;
+    return best;
+}
+
+/* The same arithmetic in the loop order the compiler can auto-vectorise (K
+ * outer, C and B walked as rows).  Still no intrinsics and no blocking, so the
+ * gap between this and the kernels is what the NPU layer actually buys.
+ * Speedup columns use whichever plain-C baseline is faster, so the reported
+ * factor can never be inflated by a slow reference loop. */
+double compiler_baseline(const std::vector<float> &A,
+                         const std::vector<float> &B,
+                         std::vector<float> &C,
+                         uint32_t M, uint32_t K, uint32_t N)
+{
+    double best = 1e30;
+    for (uint32_t rep = 0; rep < 3; ++rep) {
+        std::fill(C.begin(), C.end(), 0.0f);
+        double t0 = now_ms();
+        for (uint32_t m = 0; m < M; ++m) {
+            const float *arow = &A[static_cast<size_t>(m) * K];
+            float *crow = &C[static_cast<size_t>(m) * N];
+            for (uint32_t k = 0; k < K; ++k) {
+                const float a = arow[k];
+                const float *brow = &B[static_cast<size_t>(k) * N];
+                for (uint32_t n = 0; n < N; ++n) crow[n] += a * brow[n];
+            }
+        }
+        best = std::min(best, now_ms() - t0);
+    }
+    return best;
 }
 
 std::string results_to_json(const std::vector<BenchResult> &results,
@@ -179,6 +239,8 @@ std::string results_to_json(const std::vector<BenchResult> &results,
           << "\"ms\":" << std::fixed << std::setprecision(6) << r.ms << ","
           << "\"gflops\":" << r.gflops << ","
           << "\"baseline_ms\":" << r.baseline_ms << ","
+          << "\"baseline_scalar_ms\":" << r.baseline_scalar_ms << ","
+          << "\"baseline_compiler_ms\":" << r.baseline_compiler_ms << ","
           << "\"speedup\":" << r.speedup << ","
           << "\"bytes_read\":" << r.bytes_read << ","
           << "\"bytes_written\":" << r.bytes_written << ","
@@ -199,6 +261,9 @@ void print_results(const std::vector<BenchResult> &results)
                 "shape", "dtype", "unit", "ms", "GFLOP/s", "speedup",
                 "iters", "check");
     std::printf("-------------------------------------------------------------------------\n");
+    std::printf("speedup = vs the faster of a naive scalar triple loop and the same\n"
+                "          arithmetic in compiler-vectorisable order (plain C, no\n"
+                "          intrinsics, best of 3)\n");
     for (const auto &r : results) {
         std::printf("%-14s %-5s %-9s %10.4f %10.3f %9.2fx %8u %s\n",
                     r.shape.c_str(), r.dtype.c_str(), r.unit.c_str(),
@@ -226,6 +291,7 @@ int cmd_info(int argc, char **argv)
         std::printf("  \"backend\": \"%s\",\n", info.backend);
         std::printf("  \"simd_bits\": %u,\n", info.simd_bits);
         std::printf("  \"threads\": %u,\n", info.num_threads);
+        std::printf("  \"physical_cores\": %u,\n", info.physical_cores);
         std::printf("  \"compute_units\": %u,\n", info.num_compute_units);
         std::printf("  \"local_store_bytes\": %u,\n", info.local_store_bytes);
         std::printf("  \"tiles\": [%u,%u,%u],\n", info.tile_m, info.tile_k,
@@ -247,8 +313,8 @@ int cmd_info(int argc, char **argv)
         std::printf("  name           : %s\n", info.name);
         std::printf("  backend        : %s (%u-bit SIMD)\n", info.backend,
                     info.simd_bits);
-        std::printf("  CPU            : %s, %u logical CPUs\n",
-                    info.cpu_arch, info.num_threads);
+        std::printf("  CPU            : %s, %u units on %u physical cores\n",
+                    info.cpu_arch, info.num_threads, info.physical_cores);
         std::printf("  compute units  : %u\n", info.num_compute_units);
         std::printf("  local store    : %u KiB/SPE\n",
                     info.local_store_bytes / 1024);
@@ -338,7 +404,9 @@ int cmd_bench(int argc, char **argv)
         std::vector<float> C(static_cast<size_t>(M) * N);
         std::vector<float> Cbase(C.size());
         fill(A); fill(B);
-        double baseline = scalar_baseline(A, B, Cbase, M, K, N);
+        double baseline_scalar = scalar_baseline(A, B, Cbase, M, K, N);
+        double baseline_compiler = compiler_baseline(A, B, Cbase, M, K, N);
+        double baseline = std::min(baseline_scalar, baseline_compiler);
         uint64_t flops = 2ull * M * K * N;
         uint64_t bytes_read = (static_cast<uint64_t>(M) * K +
                                static_cast<uint64_t>(K) * N) * sizeof(float);
@@ -433,6 +501,8 @@ int cmd_bench(int argc, char **argv)
                 r.gflops = ms > 0.0 ?
                     static_cast<double>(flops) / (ms * 1e6) : 0.0;
                 r.baseline_ms = baseline;
+                r.baseline_scalar_ms = baseline_scalar;
+                r.baseline_compiler_ms = baseline_compiler;
                 r.speedup = ms > 0.0 ? baseline / ms : 0.0;
                 r.bytes_read = bytes_read;
                 r.bytes_written = bytes_written;

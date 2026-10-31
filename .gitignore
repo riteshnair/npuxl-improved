@@ -1,0 +1,16 @@
+# build output / scratch (laptop tools)
+build/
+build2/
+build3/
+*.obj
+*.exe
+*.ilk
+*.pdb
+__pycache__/
+*_run*.txt
+vnpu-trace.json
+
+# local build products and scratch (never referenced by the Makefile as sources)
+bin/
+build_scratch/
+lib/*.so.1

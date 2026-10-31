@@ -38,7 +38,7 @@ Example verdicts:
 |---|---|---|
 | dispatch-bound | too many tiny commands | batch ops, fuse bias/epilogue, enlarge tiles |
 | memory-bound | low arithmetic intensity | quantize weights, cache packed weights, larger K tile |
-| compute-bound | high arithmetic intensity | use VNNI, more workers, larger M/N blocks |
+| compute-bound | high arithmetic intensity | more units, larger M/N blocks, INT8 |
 | balanced | no single dominant bucket | try autotune |
 
 ## 3. Chrome trace
@@ -83,7 +83,11 @@ prefill and decode; a single tile config cannot be optimal for both.
 | `VNPU_THREADS` | override worker count |
 | `VNPU_TRACE` | enable tracing when non-zero |
 | `VNPU_TRACE_FILE` | default Chrome trace path |
-| `VNPU_FORCE_ISA` | `scalar`, `avx2`, or `avx512` for debug/sanitizers |
+| `cfg.num_threads` / `--threads` | unit count; default is physical cores, not logical (SMT siblings share L1/L2) |
+| `VNPU_PACK` | `0` disables F32 B panel packing (A/B control); on by default |
+| `VNPU_MODE` | `reference` forces scalar kernels, unpacked B and no pool lease |
+| `VNPU_LEASE` | `1` keeps the thread pool hot across a batch; off by default (measured negative, see PERFORMANCE) |
+| `VNPU_FORCE_ISA` | `scalar` or `avx2` for debug/sanitizers (anything else is ignored) |
 | `VNPU_DEBUG` | verbose runtime diagnostics |
 
 ## 6. Bottleneck playbook
@@ -136,11 +140,13 @@ prefill and decode; a single tile config cannot be optimal for both.
 
 ## 8. Sanitizer note
 
-GCC 14 + AddressSanitizer has a known issue with AVX-512 target attributes and
-stack stores. For sanitizer builds, force a lower ISA:
+For sanitizer builds, force the scalar path — target-attribute SIMD and stack
+stores are known to confuse some GCC versions under ASan:
 
 ```bash
 VNPU_FORCE_ISA=scalar ASAN_OPTIONS=detect_leaks=0 ./your-asan-binary
 ```
 
-or use Clang with AVX-512 disabled. The release build is unaffected.
+`VNPU_FORCE_ISA` accepts `scalar` and `avx2` only; any other value is ignored
+with a log line instead of executing instructions the CPU may not implement.
+The release build is unaffected.

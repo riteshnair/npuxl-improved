@@ -4,9 +4,9 @@
   "heads": 8,
   "layers": 2,
   "results": [
-    {"phase":"prefill","dtype":"f32","tokens":32,"ms":16.331826,"tokens_per_second":1959.364495,"gflops":25.039738,"flops":408944640},
-    {"phase":"decode","dtype":"f32","tokens":1,"ms":11.314103,"tokens_per_second":88.385268,"gflops":1.118298,"flops":12652544},
-    {"phase":"prefill","dtype":"i8","tokens":32,"ms":11.675518,"tokens_per_second":2740.777754,"gflops":35.025824,"flops":408944640},
-    {"phase":"decode","dtype":"i8","tokens":1,"ms":10.415848,"tokens_per_second":96.007542,"gflops":1.214740,"flops":12652544}
+    {"phase":"prefill","dtype":"f32","tokens":32,"ms":6.927902,"tokens_per_second":4619.002982,"gflops":59.028641,"flops":408944640},
+    {"phase":"decode","dtype":"f32","tokens":1,"ms":1.350043,"tokens_per_second":740.717147,"gflops":9.371956,"flops":12652544},
+    {"phase":"prefill","dtype":"i8","tokens":32,"ms":7.008671,"tokens_per_second":4565.773101,"gflops":58.348389,"flops":408944640},
+    {"phase":"decode","dtype":"i8","tokens":1,"ms":0.808193,"tokens_per_second":1237.327702,"gflops":15.655343,"flops":12652544}
   ]
 }

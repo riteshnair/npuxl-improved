@@ -9,10 +9,8 @@
 
 #if VNPU_X86 && (defined(__GNUC__) || defined(__clang__))
 #  define VNPU_TARGET_AVX2   __attribute__((target("avx2,fma")))
-#  define VNPU_TARGET_AVX512 __attribute__((target("avx512f,fma")))
 #else
 #  define VNPU_TARGET_AVX2
-#  define VNPU_TARGET_AVX512
 #endif
 
 namespace vnpu {
@@ -28,16 +26,6 @@ static inline float hsum256(__m256 v)
     s = _mm_hadd_ps(s, s);
     s = _mm_hadd_ps(s, s);
     return _mm_cvtss_f32(s);
-}
-
-VNPU_TARGET_AVX512
-static inline float hsum512(__m512 v)
-{
-    float tmp[16];
-    std::memcpy(tmp, &v, sizeof(v));
-    float s = 0.0f;
-    for (float x : tmp) s += x;
-    return s;
 }
 
 VNPU_TARGET_AVX2
@@ -67,27 +55,6 @@ static inline __m256 exp256_ps(__m256 x)
     return _mm256_mul_ps(p, pow2);
 }
 
-VNPU_TARGET_AVX512
-static inline __m512 exp512_ps(__m512 x)
-{
-    const __m512 log2e = _mm512_set1_ps(1.4426950408889634f);
-    x = _mm512_max_ps(_mm512_set1_ps(-80.0f),
-                      _mm512_min_ps(x, _mm512_set1_ps(80.0f)));
-    __m512 z = _mm512_mul_ps(x, log2e);
-    __m512 zi = _mm512_floor_ps(z);
-    __m512 f = _mm512_sub_ps(z, zi);
-    __m512 p = _mm512_fmadd_ps(_mm512_set1_ps(0.0013333558146428443f), f,
-                               _mm512_set1_ps(0.009618129107628477f));
-    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(0.05550410866482158f));
-    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(0.2402265069591007f));
-    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(0.6931471805599453f));
-    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.0f));
-    __m512i n = _mm512_cvtps_epi32(zi);
-    n = _mm512_add_epi32(n, _mm512_set1_epi32(127));
-    n = _mm512_slli_epi32(n, 23);
-    __m512 pow2 = _mm512_castsi512_ps(n);
-    return _mm512_mul_ps(p, pow2);
-}
 #endif /* VNPU_X86 */
 
 /* ------------------------------------------------------------------------- */
@@ -140,35 +107,6 @@ static void rmsnorm_avx2_rows(const vnpu_rmsnorm_f32_args_t &a,
     }
 }
 
-VNPU_TARGET_AVX512
-static void rmsnorm_avx512_rows(const vnpu_rmsnorm_f32_args_t &a,
-                                uint32_t begin, uint32_t end)
-{
-    float eps = a.eps > 0.0f ? a.eps : 1e-5f;
-    for (uint32_t r = begin; r < end; ++r) {
-        const float *x = a.X + static_cast<size_t>(r) * a.cols;
-        float *y = a.Y + static_cast<size_t>(r) * a.cols;
-        __m512 ss = _mm512_setzero_ps();
-        uint32_t j = 0;
-        for (; j + 16 <= a.cols; j += 16) {
-            __m512 v = _mm512_loadu_ps(x + j);
-            ss = _mm512_fmadd_ps(v, v, ss);
-        }
-        float sum = hsum512(ss);
-        for (; j < a.cols; ++j) sum += x[j] * x[j];
-        float inv = 1.0f / std::sqrt(sum / static_cast<float>(a.cols) + eps);
-        __m512 vinv = _mm512_set1_ps(inv);
-        j = 0;
-        for (; j + 16 <= a.cols; j += 16) {
-            __m512 v = _mm512_loadu_ps(x + j);
-            __m512 w = a.W ? _mm512_loadu_ps(a.W + j) :
-                             _mm512_set1_ps(1.0f);
-            _mm512_storeu_ps(y + j, _mm512_mul_ps(_mm512_mul_ps(v, w), vinv));
-        }
-        for (; j < a.cols; ++j)
-            y[j] = x[j] * inv * (a.W ? a.W[j] : 1.0f);
-    }
-}
 #endif
 
 /* ------------------------------------------------------------------------- */
@@ -241,50 +179,6 @@ static void softmax_avx2_rows(const vnpu_softmax_f32_args_t &a,
     }
 }
 
-VNPU_TARGET_AVX512
-static void softmax_avx512_rows(const vnpu_softmax_f32_args_t &a,
-                                uint32_t begin, uint32_t end)
-{
-    float inv_t = a.temperature > 0.0f ? 1.0f / a.temperature : 1.0f;
-    for (uint32_t r = begin; r < end; ++r) {
-        const float *x = a.X + static_cast<size_t>(r) * a.cols;
-        float *y = a.Y + static_cast<size_t>(r) * a.cols;
-        __m512 vmax = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
-        uint32_t j = 0;
-        for (; j + 16 <= a.cols; j += 16)
-            vmax = _mm512_max_ps(vmax, _mm512_loadu_ps(x + j));
-        float maxv = -std::numeric_limits<float>::infinity();
-        {
-            float tmp[16];
-            std::memcpy(tmp, &vmax, sizeof(vmax));
-            for (float v : tmp) maxv = std::max(maxv, v);
-        }
-        for (; j < a.cols; ++j) maxv = std::max(maxv, x[j]);
-        __m512 sumv = _mm512_setzero_ps();
-        j = 0;
-        for (; j + 16 <= a.cols; j += 16) {
-            __m512 v = _mm512_loadu_ps(x + j);
-            __m512 e = exp512_ps(_mm512_mul_ps(
-                _mm512_sub_ps(v, _mm512_set1_ps(maxv)),
-                _mm512_set1_ps(inv_t)));
-            _mm512_storeu_ps(y + j, e);
-            sumv = _mm512_add_ps(sumv, e);
-        }
-        float sum = hsum512(sumv);
-        for (; j < a.cols; ++j) {
-            float e = fast_expf((x[j] - maxv) * inv_t);
-            y[j] = e;
-            sum += e;
-        }
-        float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-        __m512 vinv = _mm512_set1_ps(inv);
-        j = 0;
-        for (; j + 16 <= a.cols; j += 16)
-            _mm512_storeu_ps(y + j,
-                             _mm512_mul_ps(_mm512_loadu_ps(y + j), vinv));
-        for (; j < a.cols; ++j) y[j] *= inv;
-    }
-}
 #endif
 
 /* ------------------------------------------------------------------------- */
@@ -460,37 +354,12 @@ static void axpy_avx2(float *dst, const float *src, float scale, uint32_t n)
     for (; i < n; ++i) dst[i] += scale * src[i];
 }
 
-VNPU_TARGET_AVX512
-static float dot_avx512(const float *a, const float *b, uint32_t n)
-{
-    __m512 acc = _mm512_setzero_ps();
-    uint32_t i = 0;
-    for (; i + 16 <= n; i += 16)
-        acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + i),
-                              _mm512_loadu_ps(b + i), acc);
-    float sum = hsum512(acc);
-    for (; i < n; ++i) sum += a[i] * b[i];
-    return sum;
-}
-
-VNPU_TARGET_AVX512
-static void axpy_avx512(float *dst, const float *src, float scale, uint32_t n)
-{
-    __m512 v = _mm512_set1_ps(scale);
-    uint32_t i = 0;
-    for (; i + 16 <= n; i += 16)
-        _mm512_storeu_ps(dst + i,
-            _mm512_fmadd_ps(_mm512_loadu_ps(src + i), v,
-                            _mm512_loadu_ps(dst + i)));
-    for (; i < n; ++i) dst[i] += scale * src[i];
-}
 #endif /* VNPU_X86 */
 
 static float dot_dispatch(const float *a, const float *b, uint32_t n,
                           uint32_t isa)
 {
 #if VNPU_X86
-    if (isa == ISA_AVX512) return dot_avx512(a, b, n);
     if (isa == ISA_AVX2) return dot_avx2(a, b, n);
 #else
     (void)isa;
@@ -504,7 +373,6 @@ static void axpy_dispatch(float *dst, const float *src, float scale,
                           uint32_t n, uint32_t isa)
 {
 #if VNPU_X86
-    if (isa == ISA_AVX512) { axpy_avx512(dst, src, scale, n); return; }
     if (isa == ISA_AVX2) { axpy_avx2(dst, src, scale, n); return; }
 #else
     (void)isa;
@@ -687,7 +555,6 @@ void kernel_rmsnorm_rows(const vnpu_rmsnorm_f32_args_t &a, uint32_t begin,
                          uint32_t end, uint32_t isa)
 {
 #if VNPU_X86
-    if (isa == ISA_AVX512) { rmsnorm_avx512_rows(a, begin, end); return; }
     if (isa == ISA_AVX2) { rmsnorm_avx2_rows(a, begin, end); return; }
 #else
     (void)isa;
@@ -699,7 +566,6 @@ void kernel_softmax_rows(const vnpu_softmax_f32_args_t &a, uint32_t begin,
                          uint32_t end, uint32_t isa)
 {
 #if VNPU_X86
-    if (isa == ISA_AVX512) { softmax_avx512_rows(a, begin, end); return; }
     if (isa == ISA_AVX2) { softmax_avx2_rows(a, begin, end); return; }
 #else
     (void)isa;
@@ -739,7 +605,7 @@ void kernel_swiglu_range(const vnpu_swiglu_f32_args_t &a, uint64_t begin,
                          uint64_t end, uint32_t isa)
 {
 #if VNPU_X86
-    if (isa == ISA_AVX2 || isa == ISA_AVX512) {
+    if (isa == ISA_AVX2) {
         swiglu_avx2_range(a, begin, end);
         return;
     }
@@ -753,7 +619,7 @@ void kernel_gelu_range(const vnpu_unary_f32_args_t &a, uint64_t begin,
                        uint64_t end, uint32_t isa)
 {
 #if VNPU_X86
-    if (isa == ISA_AVX2 || isa == ISA_AVX512) {
+    if (isa == ISA_AVX2) {
         gelu_avx2_range(a, begin, end);
         return;
     }
@@ -767,7 +633,7 @@ void kernel_add_range(const vnpu_binary_f32_args_t &a, uint64_t begin,
                       uint64_t end, uint32_t isa)
 {
 #if VNPU_X86
-    if (isa == ISA_AVX2 || isa == ISA_AVX512) {
+    if (isa == ISA_AVX2) {
         add_avx2_range(a, begin, end);
         return;
     }
@@ -781,7 +647,7 @@ void kernel_mul_range(const vnpu_binary_f32_args_t &a, uint64_t begin,
                       uint64_t end, uint32_t isa)
 {
 #if VNPU_X86
-    if (isa == ISA_AVX2 || isa == ISA_AVX512) {
+    if (isa == ISA_AVX2) {
         mul_avx2_range(a, begin, end);
         return;
     }

@@ -1,12 +1,12 @@
 === Distributed DFlash/MTP-style speculative demo ===
 hidden=128 vocab=256 gamma=4 steps=4 ports=19552,19553
-vnpu-node draft-node listening on 127.0.0.1:19552 | AVX512F+VNNI | 2 threads | auth=token
-vnpu-node verify-node listening on 127.0.0.1:19553 | AVX512F+VNNI | 2 threads | auth=token
-step  0: produced=5 accepted=4 draft=0.642 ms verify=0.268 ms 5472.5 tok/s theoretical=1.47x
-step  1: produced=5 accepted=4 draft=0.452 ms verify=0.163 ms 8089.3 tok/s theoretical=1.33x
-step  2: produced=5 accepted=4 draft=4.550 ms verify=1.619 ms 810.1 tok/s theoretical=1.31x
-step  3: produced=5 accepted=4 draft=4.782 ms verify=1.325 ms 818.1 tok/s theoretical=1.08x
-summary: 20 tokens in 13.815 ms = 1447.7 tok/s, accepted=16/20
+vnpu-node verify-node listening on 127.0.0.1:19553 | AVX2+FMA | 2 threads | auth=token
+vnpu-node draft-node listening on 127.0.0.1:19552 | AVX2+FMA | 2 threads | auth=token
+step  0: produced=5 accepted=4 draft=1.626 ms verify=0.996 ms 1905.0 tok/s theoretical=1.90x
+step  1: produced=5 accepted=4 draft=1.215 ms verify=0.606 ms 2742.5 tok/s theoretical=1.66x
+step  2: produced=5 accepted=4 draft=1.231 ms verify=0.345 ms 3168.7 tok/s theoretical=1.09x
+step  3: produced=5 accepted=4 draft=1.146 ms verify=0.336 ms 3369.2 tok/s theoretical=1.13x
+summary: 20 tokens in 7.510 ms = 2663.2 tok/s, accepted=16/20
 draft stats: jobs=16 local=0 remote=16 sent=140408 B recv=16928 B failed=0 speedup=1.00x
 verify stats: jobs=4 local=0 remote=4 sent=141688 B recv=20640 B failed=0 speedup=1.00x
 cluster-all stats: jobs=8 local=0 remote=0 sent=262384 B recv=64 B failed=0 speedup=0.00x

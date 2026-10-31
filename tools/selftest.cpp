@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <thread>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -235,6 +236,47 @@ int vnpu_run_selftest(const char *filter)
         if (vnpu_matmul_f32(r.stream, &args) != VNPU_OK) return false;
         ref_matmul(A, Bt, {}, ref, M, K, N, true, VNPU_EPILOGUE_RELU);
         return compare_vectors(C, ref, 3e-3f, 3e-3f, "gemm_nt");
+    });
+
+    /* Two streams on one device run two parallel_for calls at the same time.
+     * Kernel scratch used to be indexed by the task slot a parallel_for hands
+     * out, which is not a thread, so concurrent tiles overwrote each other's
+     * packed panel: 10 of 12 runs of this shape were wrong before the scratch
+     * became per-thread.  Nothing else in the suite overlaps two streams. */
+    run_test("concurrent_streams_same_device", []() {
+        Runtime r;
+        vnpu_stream_t *s2 = nullptr;
+        if (vnpu_stream_create(r.device, 0, &s2) != VNPU_OK) return false;
+        const uint32_t M = 192, K = 256, N = 256;
+        std::vector<float> A(static_cast<size_t>(M) * K);
+        std::vector<float> B(static_cast<size_t>(K) * N);
+        for (auto &x : A) x = rnd();
+        for (auto &x : B) x = rnd();
+        std::vector<float> C1(static_cast<size_t>(M) * N);
+        std::vector<float> C2(C1.size()), ref;
+
+        ref_matmul(A, B, {}, ref, M, K, N, false, VNPU_EPILOGUE_NONE);
+        bool ok = true;
+        for (int rep = 0; rep < 4 && ok; ++rep) {
+            std::fill(C1.begin(), C1.end(), 0.0f);
+            std::fill(C2.begin(), C2.end(), 0.0f);
+            vnpu_matmul_f32_args_t a1{};
+            a1.A = A.data(); a1.B = B.data(); a1.C = C1.data();
+            a1.M = M; a1.K = K; a1.N = N;
+            a1.alpha = 1.0f; a1.unit = VNPU_UNIT_AUTO;
+            vnpu_matmul_f32_args_t a2 = a1;
+            a2.C = C2.data();
+            std::thread t1([&]() { vnpu_matmul_f32(r.stream, &a1); });
+            std::thread t2([&]() { vnpu_matmul_f32(s2, &a2); });
+            t1.join();
+            t2.join();
+            vnpu_stream_sync(r.stream);
+            vnpu_stream_sync(s2);
+            ok = compare_vectors(C1, ref, 3e-3f, 3e-3f, "stream1") &&
+                 compare_vectors(C2, ref, 3e-3f, 3e-3f, "stream2");
+        }
+        vnpu_stream_destroy(s2);
+        return ok;
     });
 
     run_test("gemm_i8_vs_f32", []() {

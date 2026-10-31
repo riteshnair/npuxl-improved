@@ -1,1 +1,1 @@
-{"shape":"512x512x512","unit":"WILDCAT","tile_m":16,"tile_k":64,"tile_n":32,"threads":2,"best_ms":2.02171,"baseline_ms":172.85,"speedup":85.4973,"gflops":132.777}
+{"shape":"512x512x512","unit":"VOODOO","tile_m":128,"tile_k":256,"tile_n":128,"threads":2,"best_ms":2.81144,"baseline_ms":199.897,"speedup":71.1012,"gflops":95.4796}

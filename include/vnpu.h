@@ -209,7 +209,9 @@ typedef struct vnpu_device_info_t {
     uint32_t tile_m;
     uint32_t tile_k;
     uint32_t tile_n;
-    uint32_t reserved0;
+    /* Physical cores behind num_threads' logical count.  SMT siblings share
+     * L1/L2, so the default unit count follows this value. */
+    uint32_t physical_cores;
     uint64_t features;
     uint64_t l1d_bytes;
     uint64_t l2_bytes;

@@ -77,20 +77,9 @@ CpuFeatures detect_cpu_features()
         f.simd_bits = 256;
         f.bits |= VNPU_FEATURE_AVX2_FMA;
     }
-    if (__builtin_cpu_supports("avx512f") &&
-        __builtin_cpu_supports("avx512bw") &&
-        __builtin_cpu_supports("avx512dq") &&
-        __builtin_cpu_supports("avx512vl")) {
-        f.isa = ISA_AVX512;
-        f.simd_bits = 512;
-        f.bits |= VNPU_FEATURE_AVX512F;
-#if defined(__GNUC__) && (__GNUC__ >= 7 || defined(__clang__))
-        if (__builtin_cpu_supports("avx512vnni"))
-            f.bits |= VNPU_FEATURE_AVX512VNNI;
-        if (__builtin_cpu_supports("avx512bf16"))
-            f.bits |= VNPU_FEATURE_BF16;
-#endif
-    }
+    /* AVX2+FMA (Zen 3) is the top of the build's instruction ladder.  Wide
+     * AVX-512/VNNI paths were dropped: without hardware to measure them on,
+     * they were unverifiable code that also downclocked the target laptop. */
 #endif
 #elif defined(__aarch64__)
     f.arch = "aarch64";
@@ -108,6 +97,78 @@ CpuFeatures detect_cpu_features()
 
     unsigned logical = std::thread::hardware_concurrency();
     f.logical_cpus = logical ? logical : 1;
+    f.physical_cpus = f.logical_cpus;
+#if defined(__linux__)
+    /* Count distinct (package, core) pairs: hyperthread siblings share the
+     * same pair, so this is the real core count behind the logical one. */
+    {
+        std::vector<std::pair<std::string, std::string>> cores;
+        for (uint32_t cpu = 0; cpu < 4096; ++cpu) {
+            char base[128];
+            std::snprintf(base, sizeof(base),
+                          "/sys/devices/system/cpu/cpu%u/topology/", cpu);
+            auto read_one = [&](const char *name, std::string &out) {
+                std::string path = std::string(base) + name;
+                std::FILE *fp = std::fopen(path.c_str(), "r");
+                if (!fp) return false;
+                char buf[64] = {0};
+                size_t got = std::fread(buf, 1, sizeof(buf) - 1, fp);
+                std::fclose(fp);
+                if (!got) return false;
+                out.assign(buf);
+                while (!out.empty() &&
+                       (out.back() == '\n' || out.back() == '\r' ||
+                        out.back() == ' '))
+                    out.pop_back();
+                return true;
+            };
+            /* `core_cpus_list` names the sibling set, which is the reliable
+             * key: some hypervisors report the same core_id for every CPU in
+             * the guest (this reference VM does), which would collapse them
+             * all into one core.  Fall back to (package, core) when absent. */
+            std::string siblings;
+            if (read_one("core_cpus_list", siblings) && !siblings.empty()) {
+                std::pair<std::string, std::string> key{"siblings", siblings};
+                if (std::find(cores.begin(), cores.end(), key) == cores.end())
+                    cores.push_back(key);
+                continue;
+            }
+            std::string pkg, core;
+            if (!read_one("physical_package_id", pkg)) break;
+            if (!read_one("core_id", core)) break;
+            std::pair<std::string, std::string> key{pkg, core};
+            if (std::find(cores.begin(), cores.end(), key) == cores.end())
+                cores.push_back(key);
+        }
+        if (!cores.empty())
+            f.physical_cpus = static_cast<uint32_t>(cores.size());
+    }
+#elif defined(_WIN32)
+    {
+        DWORD len = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+        if (len) {
+            std::vector<uint8_t> buf(len);
+            if (GetLogicalProcessorInformationEx(
+                    RelationProcessorCore,
+                    reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
+                        buf.data()), &len)) {
+                uint32_t count = 0;
+                DWORD off = 0;
+                auto *p = reinterpret_cast<
+                    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(buf.data());
+                while (off < len) {
+                    ++count;
+                    off += p->Size;
+                    p = reinterpret_cast<
+                        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(
+                            buf.data() + off);
+                }
+                if (count) f.physical_cpus = count;
+            }
+        }
+    }
+#endif
 #if defined(__linux__)
     long l1 = sysconf(_SC_LEVEL1_DCACHE_SIZE);
     long l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
@@ -131,7 +192,6 @@ CpuFeatures detect_cpu_features()
     if (GlobalMemoryStatusEx(&ms)) f.total_memory = ms.ullTotalPhys;
 #endif
     std::string backend = isa_name(f.isa);
-    if (f.bits & VNPU_FEATURE_AVX512VNNI) backend += "+VNNI";
     f.backend = backend;
     return f;
 }
@@ -192,12 +252,19 @@ void ThreadPool::worker_loop(uint32_t index)
     }
     for (;;) {
         std::function<void()> task;
-        {
+        /* Inside a batch lease, poll for the next task for a short while
+         * before blocking: the next command's parallel_for is microseconds
+         * away, and a futex sleep/wake costs more than the spin. */
+        bool have_task = false;
+        if (lease_depth_.load(std::memory_order_acquire) != 0)
+            have_task = spin_for_task(task);
+        if (!have_task) {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait(lock, [&]() { return stopping_ || !tasks_.empty(); });
             if (stopping_ && tasks_.empty()) return;
             task = std::move(tasks_.front());
             tasks_.pop_front();
+            pending_tasks_.fetch_sub(1, std::memory_order_relaxed);
         }
         try {
             task();
@@ -209,14 +276,48 @@ void ThreadPool::worker_loop(uint32_t index)
     }
 }
 
+namespace {
+/* Spin hint for the lease path. */
+inline void relax_cpu()
+{
+#if defined(_MSC_VER)
+    _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield" ::: "memory");
+#else
+    std::this_thread::yield();
+#endif
+}
+}  // namespace
+
 void ThreadPool::enqueue(std::function<void()> task)
 {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stopping_) return;
         tasks_.push_back(std::move(task));
+        pending_tasks_.fetch_add(1, std::memory_order_release);
     }
     cv_.notify_one();
+}
+
+bool ThreadPool::spin_for_task(std::function<void()> &task)
+{
+    const uint64_t deadline =
+        vnpu::now_ns() + static_cast<uint64_t>(kLeaseSpinUs) * 1000ull;
+    uint32_t iter = 0;
+    while (pending_tasks_.load(std::memory_order_acquire) == 0) {
+        if ((++iter & 63u) == 0 && vnpu::now_ns() >= deadline) return false;
+        relax_cpu();
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (tasks_.empty()) return false;
+    task = std::move(tasks_.front());
+    tasks_.pop_front();
+    pending_tasks_.fetch_sub(1, std::memory_order_relaxed);
+    return true;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -747,29 +848,85 @@ VNPU_API vnpu_status_t VNPU_CALL vnpu_device_create(const vnpu_config_t *config,
                 device->cpu.bits &= ~(VNPU_FEATURE_AVX512F |
                                       VNPU_FEATURE_AVX512VNNI);
                 device->cpu.backend = "AVX2+FMA(forced)";
-            } else if (forced == "avx512") {
-                device->cpu.isa = vnpu::ISA_AVX512;
-                device->cpu.simd_bits = 512;
-                device->cpu.bits |= VNPU_FEATURE_AVX512F;
-                device->cpu.bits &= ~VNPU_FEATURE_AVX512VNNI;
-                device->cpu.backend = "AVX512F(forced)";
+            } else {
+                /* Refuse rather than execute instructions this CPU may not
+                 * implement: forcing an unbuilt ISA used to SIGILL. */
+                vnpu::debug_log("VNPU_FORCE_ISA=%s ignored: only scalar and "
+                                "avx2 are built", forced.c_str());
             }
         }
-        uint32_t threads = cfg.num_threads ? cfg.num_threads : device->cpu.logical_cpus;
+        /* Default to physical cores, not logical ones.  SMT siblings share the
+         * L1/L2 these kernels depend on, and a multiply-add-bound tile gains
+         * little from a second thread on the same core while losing cache.  On
+         * a 14c/18t hybrid laptop that is 14 units instead of 18. */
+        uint32_t def_units = device->cpu.physical_cpus ?
+                             device->cpu.physical_cpus :
+                             device->cpu.logical_cpus;
+        uint32_t threads = cfg.num_threads ? cfg.num_threads : def_units;
         threads = std::min<uint32_t>(threads, std::max<uint32_t>(1, device->cpu.logical_cpus));
         device->pool = std::make_unique<vnpu::ThreadPool>(
             threads, (cfg.flags & VNPU_CONFIG_PIN_THREADS) != 0);
-        device->local_stores.resize(threads);
+        /* VNPU_UNIT_WEIGHTS=2,2,1,1,1,1,1,1,1 declares each unit's relative
+         * speed (index 0 is the issuing thread).  On a hybrid CPU the P units
+         * then get proportionally more tiles, which is what stops the E units
+         * from setting the pace at every barrier.  Uniform weights keep
+         * dynamic chunk stealing, which is better whenever the partition is
+         * fine-grained. */
+        /* Reference mode: the slowest, simplest path this library can produce
+         * (scalar kernels, unpacked B, no pool lease).  Anything that still
+         * reproduces here is a caller bug rather than a fast-kernel bug -- the
+         * same isolation a software rasterizer gives a graphics driver. */
+        const char *mode = std::getenv("VNPU_MODE");
+        const bool reference = mode && std::string(mode) == "reference";
+        if (reference) {
+            device->cpu.isa = vnpu::ISA_SCALAR;
+            device->cpu.simd_bits = 0;
+            device->cpu.bits &= ~(VNPU_FEATURE_AVX2_FMA |
+                                  VNPU_FEATURE_AVX512F |
+                                  VNPU_FEATURE_AVX512VNNI);
+            device->cpu.backend = "scalar(reference)";
+        }
+        /* VNPU_PACK=0 selects the unpacked row-major tile path.  Kept so the
+         * two B-access structures can be A/B measured from one binary. */
+        device->pack_b = !reference;
+        device->batch_lease = false;
+        if (const char *penv = std::getenv("VNPU_PACK")) {
+            device->pack_b = !(penv[0] == '0' && penv[1] == '\0');
+        }
+        if (const char *lenv = std::getenv("VNPU_LEASE")) {
+            device->batch_lease = !(lenv[0] == '0' && lenv[1] == '\0');
+        }
+        if (reference) {
+            /* Reference mode wins over the A/B switches. */
+            device->pack_b = false;
+            device->batch_lease = false;
+        }
+        if (const char *wenv = std::getenv("VNPU_UNIT_WEIGHTS")) {
+            std::vector<float> w;
+            const char *q = wenv;
+            while (*q) {
+                char *end = nullptr;
+                float v = std::strtof(q, &end);
+                if (end == q) break;
+                w.push_back(v);
+                q = end;
+                while (*q == ',' || *q == ' ') ++q;
+            }
+            if (!w.empty()) device->pool->set_unit_weights(std::move(w));
+        }
+        /* One extra slot: the issuing thread executes tiles too and needs a
+         * scratch buffer of its own (worker id == num_threads - 1). */
+        device->local_stores.resize(threads + 1);
         for (auto &store : device->local_stores)
             store.resize(VNPU_LOCAL_STORE_BYTES + VNPU_CACHELINE_BYTES);
 
         uint32_t tm = cfg.tile_m, tk = cfg.tile_k, tn = cfg.tile_n;
         if (!tm || !tk || !tn) {
-            if (device->cpu.isa == vnpu::ISA_AVX512) {
-                tm = 64; tk = 256; tn = 64;
-            } else if (device->cpu.isa == vnpu::ISA_AVX2 ||
-                       device->cpu.isa == vnpu::ISA_NEON) {
-                tm = 64; tk = 128; tn = 64;
+            if (device->cpu.isa == vnpu::ISA_AVX2 ||
+                device->cpu.isa == vnpu::ISA_NEON) {
+                /* Measured best on a 256-bit core: 128x128x64 beat the old
+                 * 64x128x64 default on every dense shape tested. */
+                tm = 128; tk = 128; tn = 64;
             } else {
                 tm = 32; tk = 64; tn = 32;
             }
@@ -799,6 +956,7 @@ VNPU_API vnpu_status_t VNPU_CALL vnpu_device_create(const vnpu_config_t *config,
                       "%s", device->cpu.backend.c_str());
         device->info.simd_bits = device->cpu.simd_bits;
         device->info.num_threads = threads;
+        device->info.physical_cores = device->cpu.physical_cpus;
         device->info.num_compute_units = cfg.num_compute_units ?
                                          cfg.num_compute_units : threads;
         device->info.local_store_bytes = VNPU_LOCAL_STORE_BYTES;
@@ -1058,16 +1216,25 @@ void vnpu_stream::run()
 {
     for (;;) {
         CommandBatch batch;
+        bool more_queued = false;
         {
             std::unique_lock<std::mutex> lock(mutex);
             cv.wait(lock, [&]() { return stopping || !queue.empty(); });
             if (stopping && queue.empty()) return;
             batch = std::move(queue.front());
             queue.pop_front();
+            /* Only worth keeping the pool hot if the next command is already
+             * queued: otherwise the workers are spinning on a core some other
+             * thread could be using (measured: spinning without pending work
+             * cost 3% of prefill on a 2-vCPU box). */
+            more_queued = !queue.empty();
         }
         vnpu_status_t batch_status = VNPU_OK;
         device->busy.fetch_add(1);
         device->active_workers.fetch_add(1);
+        std::unique_ptr<vnpu::ThreadPool::ScopedLease> lease;
+        if (device->batch_lease && device->pool && more_queued)
+            lease.reset(new vnpu::ThreadPool::ScopedLease(device->pool.get()));
         for (const auto &cmd : batch.commands) {
             uint64_t cmd_begin = vnpu::now_ns();
             if (batch.queued_ns && cmd_begin > batch.queued_ns)

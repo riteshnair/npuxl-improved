@@ -14,7 +14,7 @@
    local device worker                    remote node worker
    (same process)                         (vnpu-node over TCP)
         |                                       |
-   AVX2/AVX512/VNNI                       AVX2/AVX512/VNNI
+   AVX2+FMA / NEON / scalar                 AVX2+FMA / NEON / scalar
 ```
 
 A cluster contains weighted workers. `vnpu_cluster_add_device()` adds local
